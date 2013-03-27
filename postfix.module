@@ -1,0 +1,1368 @@
+<?php
+// $Id$ 
+
+/**
+ *@file postfix.module
+ * 
+ *The setup : http://www.howtoforge.com/virtual_postfix_mysql_quota_courier
+ *
+ */
+
+ /*
+  * General todo`s 
+  *****************
+  *@todo what to do with user and forwardings if a domain was deleted
+  *@todo what to do if a user was deleted (serverstuff)
+  *
+  *@todo expand hook_help 
+  *
+  * transport hooks
+  * @see man (5) transport
+  *****************
+  *@todo postfix_transport_add
+  *@todo postfix_transport_add_submit
+  *@todo postfix_transport_add_validate
+  *@todo postfix_transport_confirm_delete
+  *@todo postfix_transport_confirm_delete_submit
+  *
+  * update-hooks
+  **************
+  *@todo update domain
+  *@todo update forwarding
+  *@todo update transport
+  *
+  */
+
+
+$domain = '(?:(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.?)+';
+$ipv4 = '[0-9]{1,3}(\.[0-9]{1,3}){3}';
+$ipv6 = '[0-9a-fA-F]{1,4}(\:[0-9a-fA-F]{1,4}){7}'; 
+
+define('REGEX_USER', '/^[a-zA-Z0-9_\-\.\+\^!#\$%&*+\/\=\?\`\|\{\}~\']+$/');
+
+$regex_at_domain = "/^@($domain|(\[($ipv4|$ipv6)\]))$/";
+
+
+global $db_url;
+$db_url = array('postfix' => variable_get('postfix_db_type', 'mysql') 
+   .'://'. variable_get('postfix_db_user','') .':'.
+   variable_get('postfix_db_passwd','') .'@'. 
+   variable_get('postfix_db_server', 'localhost') .':'.
+   variable_get('postfix_db_port','') .'/'.
+   variable_get('postfix_db', 'mail')
+);
+
+/**
+ *Returns a key/value array of all available domains in the domain table used for select-elements
+ *@param String $first The domain , 'empty' for  t('select..') (inserting a user or a forwarding) 
+ * or '%' for t('all domains') (in overviews that should appear at the first position in the array)
+ *
+ *@param Boolean $all include '%' for 'all domains' in the array for overviews
+ *
+ * @return Array of domains
+ */
+function postfix_get_domains($first = NULL, $all = FALSE) {
+  $domains = array();
+  if($first) {
+    if ($first == '%') { 
+      $domains['%'] = t('all domains');      
+    } elseif ($first == t('select...')) {
+      $domains['empty'] = t('select...');
+    } else {
+      $domains[$first] = $first;
+      $sql = "SELECT domain from {domains} WHERE domain != %s";
+    }
+  } 
+  $sql = "SELECT domain from {domains}";
+  db_set_active('postfix');
+  $result = db_query($sql, $first);
+  while($res = db_fetch_array($result)){
+    $domains[$res['domain']] = $res['domain'];
+  }
+  if ($all) {
+    $domains['%'] = t('all domains');
+  }
+  db_set_active();
+  return $domains;
+}
+
+/**
+ *Returns a form to filter by domains which is used in _overview functions 
+ *@param $domain the 
+ *
+ */
+function postfix_domain_filter($domain = NULL) {
+  if ($domain && $domain != '%') {
+    $filter_domain = $domain;
+    $domains = postfix_get_domains($domain, TRUE);
+  } else {
+    $filter_domain = '%';
+    $domains = postfix_get_domains('%');
+  }
+  $form['filter'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Filter by domain'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#weight' => -10,
+    '#prefix' => '<div class="container-inline">',
+    '#suffix' => '</div>',
+  );
+  $form['filter']['select'] = array(
+    '#type' => 'select',
+    '#title' => t('Domain'),
+    '#options' => $domains,
+    '#weight' => -9,
+    '#attributes'=> '',
+    '#submit' => TRUE,
+  );
+  $form['filter']['submit'] = array(
+    '#type' => 'submit', 
+    '#value' =>t('Filter')
+  );
+  return $form;
+
+}
+
+
+
+/**
+ * Display help and module information
+ * @param section which section of the site we're displaying help 
+ * @return help text for section
+ */
+function postfix_help($section='') {
+  $output = '';
+  switch ($section) {
+    case 'admin/modules#description':
+      $output = t('Allows to adminster your mail-database of postfix-mysql or postfix-pgsql via drupal');
+      break;
+    case 'admin/help#postfix';
+      $output = t("empty");
+      break;
+    case 'user/help#postfix';
+      $output = t("empty");
+      break;           
+  }
+  return $output;
+} // function  postfix_help
+
+/**
+ * Valid permissions for this module
+ * @return array An array of valid permissions for the postfix module
+ */
+function postfix_perm() {
+  return array(
+    'administer postfix', 
+  );
+} // function postfix_perm
+
+/**
+ *Implementtation of hook_settings 
+ *@return settings HTML or deny access
+ *@todo implement possibility to change settings after initial settings
+ */
+function postfix_settings() {
+  if (!user_access('administer postfix')) {
+    return ;
+  }
+  $form['postfix_db_settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Database settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+  ); 
+  $form['postfix_db_settings']['postfix_db_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('Database type'),
+    '#default_value' => variable_get('postfix_db_type', 'mysql'),
+    '#options' => array('mysql'=>'MySQL','pgsql'=>'PostgreSQL'), 
+    '#description' => t('Chose the type of your Database'),
+    '#required' => TRUE,
+  );
+  $form['postfix_db_settings']['postfix_db_server'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Database server'),
+    '#default_value' => variable_get('postfix_db_server', 'localhost'),
+    '#description' => t('Name or ip-adress of your database-server'),
+    '#required' => TRUE,
+  );
+  $form['postfix_db_settings']['postfix_db'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Database'),
+    '#default_value' => variable_get('postfix_db', 'mail'),
+    '#description' => t('Name of your postfix database'),
+    '#required' => TRUE,
+  );
+  $form['postfix_db_settings']['postfix_db_port'] = array(
+   '#type' => 'textfield',
+   '#title' => t('Port'),
+   '#default_value' => variable_get('postfix_db_port', ''),
+   '#description' => t('Port of your postfix database if not standard port'),
+   '#required' => FALSE,       
+   '#validate' => array('postfix_settings_validate' => array()),
+  );
+  $form['postfix_db_settings']['postfix_db_user'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Database user'),
+    '#default_value' => variable_get('postfix_db_user',''),
+    '#description' => t('Name of database user'),
+    '#required' => TRUE,
+  );
+    
+  $form['postfix_db_settings']['postfix_db_passwd'] = array(
+    '#type' => 'password_confirm',
+    '#title' => t('Database password'),
+    '#default_value' => variable_get('postfix_db_passwd',''),
+    '#description' => t('Password of database user'),
+    '#required' => TRUE,
+  ); 
+  $form['postfix_activation_mail_setting'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Activation-Mail settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+  $form['postfix_activation_mail_setting']['postfix_activation_mail_address'] = array(
+    '#type' => 'textfield',
+    '#title' => t('E-mail address'),
+    '#default_value' => variable_get('postfix_activation_mail_address',''),
+    '#description' => t('E-mail address that is used to send activation mails'),
+    '#required' => TRUE,
+    '#validate' => array('postfix_settings_validate' => array()),
+  );
+  $form['postfix_activation_mail_setting']['postfix_activation_mail_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Subject'),
+    '#default_value' => variable_get('postfix_activation_mail_subject',t('Activation mail')),
+    '#description' => t('Subject of the activation mails'),
+    '#required' => TRUE,
+  );
+  $form['postfix_activation_mail_setting']['postfix_activation_mail_body'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Subject'),
+    '#default_value' => variable_get('postfix_activation_mail_body',t('Text of the activation mail')),
+    '#description' => t('Body of the activation mails'),
+    '#required' => TRUE,
+  );
+  return $form;
+
+//return drupal_get_form('postfix_settings', $form);
+}// function postfix_settings
+
+/**
+ *Validation of postfix_settings
+ *@todo Check Port/Problem with 0
+ *@todo check edit[postfix_db_server]');
+ *@param $form the form of postfix_settings
+ */
+function postfix_settings_validate ($form) {
+  switch($form['#name']) {
+    case "edit[activation_mail_address]":
+      if (!valid_email_address($form['#value'])) {
+        form_set_error('activation_mail_address', t('%email is not a valid e-mail address.', array('%email' => $form['#value'])));
+      }
+      break;
+    case "edit[postfix_db_port]":
+      if (!empty($form['#value'])){
+        //if (preg_match($regex_int, $form['#value'])) {
+        if (!is_numeric($form['#value'])) {
+          form_set_error('postfix_db_port', t('%port is not an integer', array('%port' => $form['#value'])));
+        //Port between 1-65535?
+        //} else if ($form['#value'] <= 1 || $form['#value'] >= 65535) { 
+        } else if (! in_array($form['#value'], range(1, 65535)) || $form['value'] == "0"){  
+          //if(preg_match('/^[^0]/',$form['#value']))
+          //if ($form['value'] == 0)  
+          drupal_set_message('@todo check edit[postfix_db_port](Problem mit 0): '. $form['#value']);
+          form_set_error('postfix_db_port', t('Port is not is not in the range between 1 and 65535.'));    
+        }
+      }
+      break;
+    case 'edit[postfix_db_server]':
+      drupal_set_message('@todo check edit[postfix_db_server]');
+      break;    
+  }
+}// postfix_settings_validate
+
+/**
+ * Implementation of hook_menu().
+ */
+function postfix_menu($may_cache) {
+  $items = array();
+  if($may_cache) {
+    $items[] = array(
+      'path' => 'admin/postfix',
+      'title' => 'postfix',
+      'access' => user_access('administer postfix'),
+      'callback' => 'postfix_admin'
+    );  
+    $items[] = array(
+      'path' => 'admin/postfix/users',
+      'title' => t('user'),
+      'access' => user_access('administer postfix'),
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+      'weight' => -10,
+    );
+    $items[] = array(
+      'path' => 'admin/postfix/users/overview',
+      'title' => t('user overview'),
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+      'weight' => -10
+    );          
+    $items[] = array(
+      'path' => 'admin/postfix/users/add',
+      'title' => t('add user'),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => -9
+    );          
+    $items[] = array(
+      'path' => 'admin/postfix/domains',
+      'title' => t('domains'),
+      'access' => user_access('administer postfix'),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => -9,
+    );
+    $items[] = array(
+      'path' => 'admin/postfix/domains/overview',
+      'title' => t('domain overview'),
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+      'weight' => -10
+    );          
+    $items[] = array(
+      'path' => 'admin/postfix/domains/add',
+      'title' => t('add domain'),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => -9
+    );          
+    
+    $items[] = array(
+      'path' => 'admin/postfix/forwardings',
+      'title' => t('forwardings'),
+      'access' => user_access('administer forwardings'),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => -8
+    );
+    $items[] = array(
+      'path' => 'admin/postfix/forwardings/overview',
+      'title' => t('forwardings overview'),
+      'access' => user_access('administer forwardings'),
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+      'weight' => -10
+    );
+    $items[] = array(
+      'path' => 'admin/postfix/forwardings/add',
+      'title' => t('add forwarding'),
+      'access' => user_access('administer forwardings'),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => -9
+    );      
+    
+    $items[] = array(
+      'path' => 'admin/postfix/transport',
+      'title' => t('transport'),
+      'access' => user_access('administer postfix'),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => -7
+     );
+     $items[] = array(
+      'path' => 'admin/postfix/transport/overview',
+      'title' => t('transport overview'),
+      'access' => user_access('administer transports'),
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+      'weight' => -10
+    );
+    $items[] = array(
+      'path' => 'admin/postfix/transport/add',
+      'title' => t('add transport'),
+      'access' => user_access('administer transports'),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => -9
+    );                           
+          
+  }
+  else {
+    if (arg(0) == 'user' && is_numeric(arg(1))) {
+      $items[] = array(
+        'path' => 'user/'. arg(1). '/edit/postfix',
+        'title' => t('email settings'),
+        'access' => user_access('administer own account'),
+        'type' => MENU_LOCAL_TASK,
+        'weight' => 10,
+        'callback' => 'postfix_user_user'
+      );
+    }       
+  }
+  return $items;
+}// funtion postfix_menu
+
+/**
+ * Major callback for postfix_menu for all items placed under admin/postfix
+ *@param $table the table that should be used [domains users forwardings transport]
+ *@param $op the operation that should be executed [add delete change filter]
+ *@param $arg filterexpression [domains.domain users.email forwardings.source transport.domain]
+ *@param $op4 optional
+ *@param $op5 optional
+ *@return HTML output
+ */
+ 
+function postfix_admin($table = NULL,$op = NULL, $arg = NULL, $op4 = NULL, $op5 = NULL) {
+  switch ($table) {
+    case 'domains': 
+      switch ($op) {
+        case 'add':
+          if (!empty($arg)) {
+            $output .= postfix_domain_add($arg);
+          } else {
+            $output .= postfix_domain_add();          
+          }
+          break;
+        case 'delete':
+          $form['#redirect'] = array(
+            'admin/postfix/domains/overview'
+          );
+          $form['domain'] = array(
+            '#type' => 'value',
+            '#value' => $arg,
+          );
+          $output = confirm_form('postfix_domain_delete_confirm', $form, 
+            t('Are you sure you want to delete the domain %domain',
+            array('%domain' => $arg)), 'admin/postfix/domains/overview'
+          );
+          break;             
+        default:
+          $output .= postfix_domain_overview();
+      }
+      break;
+    case 'users': 
+      switch ($op){
+        case 'add':
+          if (!empty($arg) && !empty($op4)){
+            $output .= postfix_user_add($arg, $op4, $op5);
+          } else {
+            $output .= postfix_user_add();          
+          }
+          break;
+        case 'delete':
+          $form['#redirect'] = array(
+            'admin/postfix/users/overview'
+          );
+          $form['user'] = array(
+            '#type' => 'value',
+            '#value' => $arg,
+          );
+          $output = confirm_form('postfix_user_delete_confirm', $form,
+            t('Are you sure you want to delete the user %user',
+            array('%user' => $arg)), 'admin/postfix/users/overview'
+          );          
+          break;
+        case 'filter':
+          $output .= postfix_user_overview($arg);
+          break;
+        default:
+          $output .= postfix_user_overview();
+       }      
+       break;    
+    case 'transport': 
+      switch($op) {
+        case 'add':
+          $output .= 'transport add';
+          break;
+        case 'change':
+          $output .= 'transport change';
+          break;
+        case 'delete':
+          $output .= 'transport delete';
+          break;
+        default:
+          $output .= postfix_transport_overview($arg);
+      }
+      break;
+    case 'forwardings':
+      switch($op) {
+        case 'add':
+          if(!empty($arg) && !empty($op4)) {
+           $output = postfix_forwarding_add($arg, $op4);
+          } else {
+            $output .= postfix_forwarding_add();
+          }
+          break;
+        case 'delete':
+          $form['#redirect'] = array(
+            'admin/postfix/forwardings/overview',
+          );
+          $form['source'] = array(
+            '#type' => 'value', 
+            '#value' => $arg,
+          );
+          $form['_destination'] = array(
+            '#type' => 'value',
+            '#value' => $op4,
+          );
+          $output = confirm_form('postfix_forwarding_delete_confirm', $form, 
+            t('Are you sure you want to delete the forwarding from %source to %destination', 
+            array('%source' => $arg, '%destination' => $op4)), 'admin/postfix/forwardings/overview'
+          );
+          break;
+        case 'filter':
+          $output .= postfix_forwardings_overview($arg);
+          break;
+        default:
+          $output .= postfix_forwardings_overview();
+      }
+      break;    
+    default: 
+      $output .= postfix_user_overview();
+  }
+  return $output;   
+}
+
+/**
+ *Form for adding and deleting a domain
+ *@param $domain
+ *@return HTML output via drupal_get_form
+ */
+function postfix_domain_add($domain = NULL) {
+  $form['#redirect'] = array(
+    'admin/postfix/domains/overview'
+  );
+  $form['domain'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $domain,
+    '#title' => t('Domain'),
+    '#description' => t('Name of the domain you want to add'),
+    '#required' => TRUE,
+  );
+  if (empty($domain)) {
+    $form['add_domain_submit'] = array(
+      '#type' => 'submit',
+      '#value' => t('add'),
+    );
+  } else {
+    $form['orig_domain'] = array(
+      '#type' => 'hidden',
+      '#value' => $domain,
+    ); 
+    $form['change'] = array(
+      '#type' => 'submit',
+      '#value' => t('change'),
+    );
+    $form['delete'] = array(
+      '#type' => 'submit',
+      '#value' => t('delete'),
+    );       
+  }
+  return drupal_get_form('postfix_domain_add', $form);
+}// function postfix_domain_add
+
+
+/**
+ * Validation of postfix_domain_add()
+ * check if domain is a valid url and check if domain already exist in the domain-table
+ * 
+ */
+function postfix_domain_add_validate($form_id, $form_values) {
+  if ($_POST['op'] == t('add')) {
+    if (!empty($form_values['domain']) && !valid_url($form_values['domain'])) {
+        form_set_error('',t('%domain is not a valid URL',$form_values['domain']));
+    } else {
+      $query = "SELECT domain FROM {domains} WHERE domain = '%s'";
+      db_set_active('postfix');
+      if (db_num_rows(db_query($query, $form_values['domain'])) != 0){
+        db_set_active('default');    
+        form_set_error('',$form_values['domain']. t(' already exists in domains'));
+      }
+      db_set_active('default');    
+     }
+  }
+}// function postfix_domain_add_validate
+
+/**
+ *Submission of postfix_domain_add()
+ */
+function postfix_domain_add_submit($form_id, $form_values){
+  switch($_POST['op']){
+    case t('add'):
+      $msg_succ =  t('Domain %domain inserted',array('%domain' => $form_values['domain']));
+      db_set_active('postfix');
+      $query = "INSERT INTO {domains} (domain) VALUES ('%s')";
+      if(db_query($query, $form_values['domain'])){
+        drupal_set_message($msg_succ);
+        watchdog('postfix',$msg_succ ,WATCHDOG_NOTICE);
+      }
+      db_set_active('default');
+     break;
+    case t('change'):
+      break;
+    case t('delete'):    
+      drupal_goto('admin/postfix/domains/delete/'. $form_values['domain']);       
+  }
+}// function postfix_domain_add_submit
+
+/**
+ * Deletes a domain from postfix.domains 
+ * Submitting postfix_domain_delete_confirm() which is called by postfix_menu()
+ */
+function postfix_domain_delete_confirm_submit($form_id, $form_values) {
+  $msg_succ = t('Domain %domain deleted', array('%domain' => $form_values['domain']));
+  $msg_fail ='';
+  $sql = "DELETE FROM {domains} WHERE domain = '%s'";
+  db_set_active('postfix');
+  if (db_affected_rows(db_query($sql, $form_values['domain'])) == 1) {
+    drupal_set_message($msg_succ);
+    watchdog('postfix', $msg_succ, WATCHDOG_NOTICE);
+  } else {
+    drupal_set_message($msg_fail);
+    watchdog('postfix', $msg_fail, WATCHDOG_NOTICE);
+  }      
+  db_set_active(); 
+}// function postfix_domain_delete_confirm_submit
+
+/**
+ *
+ */
+function postfix_domain_overview() {
+  $header  = array(
+    array('data' => t('Domain'), 'field' => 'd.domain', 'sort' => 'asc'), 
+    //array('data' => t('Operations'), 'rowspan' => 2)
+    array('data' => t('Operations'))
+  );
+  $sql = 'SELECT d.domain FROM {domains} d';
+  $sql .= tablesort_sql($header);
+  db_set_active('postfix');
+  $result = pager_query($sql, 50); 
+  db_set_active('default');  
+
+  while ($domain = db_fetch_object($result)) { 
+    $rows[] = array( 
+      $domain->domain,
+      //l(t('edit'), "admin/postfix/domains/add/".$domain->domain, array()),
+      l(t('delete'), "admin/postfix/domains/delete/".$domain->domain, array())
+    );
+    $output = theme('table', $header, $rows);
+    $output .= theme('pager', NULL, 50, 0); 
+  };
+
+return $output;
+}
+
+
+/**
+ *User centric view under "my account/edit/email settings"
+ *Calls postfix_user_add()
+ *@return HTML output via drupal_get_form of postfix_user_add($user->mail) 
+ *@see postfix_user_add();
+ */
+function postfix_user_user(){
+  global $user;
+  $sql ='SELECT u.email, u.quota, f.destination FROM {users} u LEFT JOIN {forwardings} f ON u.email = f.source WHERE u.email = \'%s\'';
+  db_set_active('postfix');
+  if (db_num_rows($result = db_query($sql,$user->mail))){
+    $account = db_fetch_object($result); 
+    db_set_active();
+    return postfix_user_add($user->mail, $account->quota, $account->destination);
+  } else {
+    db_set_active();
+    form_set_error(t('Please check your email'));
+  }
+  
+}// function postfix_user_user
+
+/**
+ *Form for adding or changing a user
+ *@param $email
+ *@param $quota
+ *@param $destination 
+ *@return HTML output via drupal_get_form
+ *@todo check permissions
+ */
+function postfix_user_add($email = NULL, $quota = NULL, $destination = NULL) {
+  if (empty($email)){
+    $form['user'] = array(
+      '#type' => 'textfield',
+      '#title' => t('User'),
+      '#description' => t('Name of the account'),
+      '#size' => 20,
+      '#maxlength' => 60, 
+      '#required' => TRUE,
+      '#weight' => -10,
+      '#prefix' => '<div style="float:left">',
+      '#suffix' => '</div>',
+    );
+    $form['at'] = array(
+      '#type' => 'item',
+      '#value' => '@',
+      '#weight' => -9,
+      '#prefix' => '<div style="float:left;margin-top:1em;font-size:1.2em">',
+      '#suffix' => '</div>',
+    );
+    $form['domain'] = array(
+      '#type' => 'select',
+      '#options' => postfix_get_domains('select...', FALSE ),
+      '#title' => t('Domain'),
+      '#description' => t('Name of the domain you want the user add to'),
+      '#required' => TRUE,
+      '#weight' => -8,
+      '#prefix' => '<div style="float:left">',
+      '#suffix' => '</div><div style="clear:left"></div>',
+    );   
+  } else {
+      list($user, $domain) = split('@', $email);
+    
+      $form['email'] = array (
+        '#type' => 'Item',
+        '#title' => t('E-Mail Account'),
+        '#value' => $email,
+        '#weight' => -10,
+      );
+      $form['user'] =  array (
+        '#type' => 'hidden',
+        '#value' => $user,
+      );
+      $form['domain'] =  array (
+        '#type' => 'hidden',
+        '#value' => $domain,
+      );
+  } 
+  $form['#redirect'] = array(
+    'admin/postfix'
+  );
+  $form['password'] = array(
+    '#type' => 'password_confirm',
+    '#title' => t('Password'),
+    '#required' => TRUE,
+    '#weight' => -7,
+    '#description' => t('To change the current user password, enter the new password in both fields.'),
+  );
+  if(user_access('administer quota') || user_access('administer own quota')){
+    $form['quota'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Quota'),
+      '#default_value' => $quota,
+      '#description' => t('Quota in Byte'),
+      '#required' => FALSE,
+      '#weight' => -6,
+    ); 
+  }
+  if (empty($email) && empty($quota)) {
+    $form['submit'] = array(
+      '#type' => 'submit',
+      '#value' => t('add'),
+    ); 
+  } else {
+    $form['password']['#required'] = FALSE;
+    $form['change'] = array(
+      '#type' => 'submit',
+      '#value' => t('change'),
+    );
+    // comparable value for update operation
+    $form['quota_orig'] = array(
+      '#type' => 'hidden',
+      '#value' => $quota,
+    );
+    $form['delete'] = array(
+      '#type' => 'submit',
+      '#value' => t('delete'),
+    );
+  }
+  if(user_access('administer forwardings') || user_access('administer own forwardings')){
+    $form['forwardings'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('forwardings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => -5,    
+    );
+    $form['forwardings']['_destination'] = array(
+      '#type' => 'textarea',
+      '#title' => t('destination'),
+      '#default_value' => $destination,
+      '#description' => t('destination e-mail adress or colon seperated list of e-mail adresses'),
+    );        
+  }
+
+return drupal_get_form('postfix_user_add', $form);
+}// function postfix_user_add
+
+/**
+ *Validation of postfix_user_add
+ *@todo check permissions
+ *@todo if/else or switch for $_POST['op`] (change)
+ */
+function postfix_user_add_validate($form_id, $form_values) {
+  if ($_POST['op'] == t('add')) {
+    // check if user contains invalid characters 
+    if (!preg_match(REGEX_USER, $form_values['user'])) {  
+      form_set_error('user', t('User %user contains invalid characters', array('%user' => $form_values['user'])));    
+    }
+    // check if a domain has been chosed
+    if ($form_values['domain'] == 'empty') {
+      form_set_error('domain',t('%name field is required.', array('%name' => t('Domain'))));
+    }
+    if ($form_values['domain'] != 'empty' && preg_match(REGEX_USER, $form_values['user'])) {
+      db_set_active('postfix');
+      $res = db_query('SELECT `email` FROM `users` WHERE `email` = \''.$form_values['user'].'@'.$form_values['domain'].'\'');
+      db_set_active();
+      //check if user already exists in database
+      if (db_num_rows($res) == 1) {
+        form_set_error('user',t('User in combination with domain, %email already exists in database.', array('%email' => $form_values['user']. '@' .$form_values['domain'])));
+        form_set_error('domain',t('Domain in combination with user, %email already exists in database.', array('%email' => $form_values['user']. '@' .$form_values['domain'])));
+      } 
+    }
+  }
+  // check if quota is numeric
+  if (!empty($form_values['quota']) && !preg_match('/^[1-9]+[0-9]*$/',$form_values['quota'])) {
+    form_set_error('quota',t('Quota is not numeric'));
+    drupal_set_message(gettype($form_values['quota']));
+  }
+  // if _destination has a value check if the destination is a valid email-address
+  // @todo function for checking multiple csv-recipients
+  if ((!empty($form_values['_destination']) && !valid_email_address($form_values['_destination']))) {
+    form_set_error('_destination', t('%mail is not a valid email-address.', array('%mail' => $form_values['_destination'])));    
+  } 
+  
+  // Debug
+  //print_r($form_values); 
+  //print_r($_POST); 
+}
+
+/**
+ *Submission of postfix_user_add() 
+ *switches $_POST['op']: add, change, delete
+ *@todo check permissions
+ */
+function postfix_user_add_submit($form_id, $form_values) {
+  switch($_POST['op']) {
+    case t('add'):
+      $msg_succ = t('User %user inserted', array('%user' => $form_values['user']. '@' .$form_values['domain']));
+      $msg_fail = t('');
+      if ($form_values['quota']) {
+        $sql = 'INSERT INTO `users` (`email`, `password`, `quota`) VALUES (\'%s@%s\', ENCRYPT(\'%s\'), \'%s\')';
+      } else {
+        //using default quota
+        $sql = 'INSERT INTO `users` (`email`, `password`) VALUES (\'%s@%s\', ENCRYPT(\'%s\'))';
+      }
+      db_set_active('postfix');
+      if (db_affected_rows(db_query($sql, $form_values['user'], $form_values['domain'], $form_values['password'], $form_values['quota']) ==1)) {
+        drupal_set_message($msg_succ);
+        watchdog('postfix',$msg_succ);
+        //sending activation mail to activate the new account
+        if (mail($form_values['user'] .'@'. $form_values['domain'], 
+        variable_get('postfix_activation_mail_activation_mail_subject',''), 
+        variable_get('postfix_activation_mail_activation_mail_body',''), 
+        'From:'. variable_get('postfix_activation_mail_address','')
+        )){
+          drupal_set_message(t('Activation Mail send'));
+          if(!empty($form_values['_destination'])) {
+            $sql = 'INSERT INTO `forwardings` (`source`, `destination`) VALUES (\'%s@%s\', \'%s\')';
+            db_set_active('postfix');
+            if (db_affected_rows(db_query($sql, $form_values['user'], $form_values['domain'], $form_values['_destination']))) {
+              $msg_succ = t('forwarding from %source to %destination inserted', 
+                array('%source' => $form_values['user'] .'@'. $form_values['domain'],
+                '%destination' => $form_values['_destination'])
+              );
+              drupal_set_message($msg_succ);
+              watchdog('postfix',$msg_succ);
+            }
+          }
+        }
+      } else {
+        drupal_set_message($msg_fail, 'error');
+      }
+      db_set_active('default');
+      break;
+    case t('delete'):
+      // redirect to a delete_confirm-form
+      drupal_goto('admin/postfix/users/delete/'.$form_values['user']. '@' . $form_values['domain']);
+      break;
+    case t('change'):
+      
+      $email = $form_values['user'].'@'.$form_values['domain'];/** users.email */
+
+      /* SQL quota+password
+      **********************
+      UPDATE `users` SET `password` = ENCRYPT( 'foo' ) ,
+      `quota` = '1234567' WHERE `users`.`email`  = 'nuups@pupsi.de'  ;
+      */
+
+      $sql  = 'UPDATE `users` ';
+      $sql_where = ' WHERE `users`.`email` = \'%s\'';
+      
+      // check if password was entered
+      if ($form_values['password']) {
+        $msg_succ = t('Password for %email changed', array('%email' => $email));
+        $sql .=  'SET `password` = ENCRYPT(\'%s\')'.$sql_where;
+        db_set_active('postfix');
+        if (db_query($sql,$form_values['password'], $email)){
+          drupal_set_message($msg_succ);
+          watchdog('postfix', $msg_succ);
+        }
+        db_set_active('default');
+      }
+      // check if quota differs
+      if ($form_values['quota'] != $form_values['quota_orig']) {
+        //Debug
+        drupal_set_message('Quota unterscheidet sich -> Update');
+
+        $msg_succ = t('Quota for %email changed from %quota_orig to %quota',array('%email' => $email, '%quota_orig' => $form_values['quota_orig'], '%quota' => $form_values['quota'] ));
+        $sql .= 'SET `quota` = \'%s\''.$sql_where;
+        db_set_active('postfix');
+        if (db_query($sql,$form_values['quota'], $email)) {
+          drupal_set_message($msg_succ);
+          watchdog('postfix', $msg_succ);
+        }
+        db_set_active('default');
+      }
+      break;
+  }
+}//function postfix_user_add_submit()
+
+/**
+ * Submission postfix_user_delete_confirm()
+ *@todo check permissions
+ */
+function postfix_user_delete_confirm_submit($form_id, $form_values) {
+  $msg_succ = t('%user deleted', array('%user' => $form_values['user']));
+  $msg_fail =  t('Could not delete %user', array('%user' => $form_values['user']));
+  $sql = "DELETE FROM {users} WHERE email = '%s'";
+  db_set_active('postfix');
+  if (db_affected_rows(db_query($sql, $form_values['user'])) == 1) {
+    drupal_set_message($msg_succ);
+    watchdog('postfix', $msg_succ, WATCHDOG_NOTICE);
+  } else {
+    drupal_set_message($msg_fail);
+  }
+   db_set_active('default');
+}// function postfix_user_delete_confirm_submit 
+
+/**
+ *Creates an overview of all users with users.email, users.quota, forwardings.destination 
+ *@domain The specific domain for the overview
+ *@return HTML output
+ *@todo check permissions
+ */
+function postfix_user_overview($domain = NULL) {
+  if ($domain && $domain != '%') {
+    $filter_domain = $domain;
+    $domains = postfix_get_domains($domain, TRUE);
+  } else {
+    $filter_domain = '%';
+    $domains = postfix_get_domains('%');
+  }
+  $form['#method'] = 'post';
+  $form['filter'] = array(
+    '#type' => 'select',
+    '#title' => t('Filter by domain'),
+    '#options' => $domains,
+    '#weight' => -9,
+    '#attributes'=> '',
+    '#submit' => TRUE,
+  );
+  $form['submit'] = array('#type' => 'submit', '#value' =>t('Filter'));
+  
+  $output =  drupal_get_form('postfix_user_overview',$form);
+  
+  $header  = array(
+    array('data' => t('Email'), 'field' => 'u.email', 'sort' => 'asc'),
+    array('data' => t('Quota'), 'field' => 'u.quota'),
+    array('data' => t('Forwarding'), 'field' => 'f.destination'),    
+    t('Operations')    
+  );
+
+  $sql = "SELECT u.email, u.quota, f.destination FROM {users} u LEFT JOIN {forwardings} f ON u.email = f.source WHERE u.email like '%@". $filter_domain ."'";
+  $sql .=  tablesort_sql($header );
+  db_set_active('postfix');
+  $result = pager_query($sql, 50); 
+  db_set_active('default');  
+
+  while ($account = db_fetch_object($result)) { 
+    $rows[] = array(
+      $account->email,
+      $account->quota,
+      $account->destination,
+      l(t('edit'), "admin/postfix/users/add/". $account->email ."/". $account->quota ."/".  $account->destination, array()),
+      l(t('delete'), "admin/postfix/users/delete/".$account->email, array())
+    ); 
+  };
+    $output .= theme('table', $header, $rows);
+    $output .= theme('pager', NULL, 50, 0); 
+  return $output;
+}//function postfix_user_overview()
+
+/**
+ *Used for generating an overview depending in the selected item in postfix_user_overview(), sends the user to overview under 'admin/postfix' for an overview of  of t('all domains') or to 'admin/postfix/users/filter/$domain' via drupal_goto() to display only forwardings for the selected domain
+ *@todo check permissions
+ */
+function postfix_user_overview_submit($form_id, $form_values){
+  if ($form_values['filter'] == '%') {
+    drupal_goto('admin/postfix');
+  } else {
+    drupal_goto('admin/postfix/users/filter/'.$form_values['filter']);
+  } 
+}//function postfix_user_overview_submit()
+
+/**
+ *@todo check permissions
+ */
+function postfix_forwarding_add($source = NULL, $destination = NULL) {
+  $domains = array('empty' => t('select...'));  
+  db_set_active('postfix');
+  $result = db_query("SELECT domain from {domains}");
+   while($res = db_fetch_array($result)){
+    $domains[$res['domain']] = $res['domain'];
+  }
+  db_set_active('default');
+  if (!empty($source)) {
+    list($user, $domain) = explode("@", $source);
+  }
+  $form['#redirect'] = array(
+    'admin/postfix/forwardings/overview',
+  );
+  $form['user'] = array(
+    '#type' => 'textfield',
+    '#title' => t('user'),
+    '#default_value' => $user,
+    '#description' => t('Leave blank for catch-all'),
+    '#size' => 20,
+    '#maxlength' => 60, 
+    '#weight' => -10,
+    '#prefix' => '<div style="float:left">',
+    '#suffix' => '</div>',
+    );
+   $form['at'] = array(
+     '#type' => 'item',
+     '#value' => '@',
+     '#weight' => -9,
+     '#prefix' => '<div style="float:left;margin-top:1em;font-size:1.2em">',
+     '#suffix' => '</div>',
+   );
+  $form['domain'] = array(
+    '#type' => 'select',
+    '#title' => t('Domain'),
+    '#required' => TRUE,
+    '#options' => $domains,
+    '#weight' => -8,
+    '#attributes'=> '',
+    '#prefix' => '<div style="float:left">',
+    '#suffix' => '</div><div style="clear:left"></div>',
+  );
+  if (!empty($domain)) {
+    $form['domain']['#value'] = $domain;
+  }
+  $form['_destination'] = array(
+    '#type' => 'textarea',
+    '#title' => t('destination'),
+    '#default_value' => $destination,
+    '#description' => t('destination e-mail adress or colon seperated list of e-mail adresses'),
+    '#required' => TRUE,
+    '#weight' => -7,
+  );      
+  if(empty($source) && empty($destination)) {
+    $form['add'] = array(
+      '#type' => 'submit',
+      '#value' => t('add'),
+    );
+  }
+  else {
+    $form['orig_source'] = array(
+      '#type' => 'hidden',
+      '#value' => $source,
+    ); 
+    $form['orig_destination'] = array(
+      '#type' => 'hidden',
+      '#value' => $destination,
+    );     
+    $form['change'] = array(
+      '#type' => 'submit',
+      '#value' => t('change'),
+    );
+    $form['delete'] = array(
+      '#type' => 'submit',
+      '#value' => t('delete'),
+    );       
+  }
+  return drupal_get_form('postfix_forwarding_add', $form);
+}// function postfix_forwarding_add()
+
+/**
+ *Validation of postfix_forwarding_add
+ *@todo check source does exist in domains 
+ *@todo check source und _destination source an destiantion are the same
+ *@todo check csv for destinations
+ *@todo change
+ *@todo check permissions
+ */
+function postfix_forwarding_add_validate($form_id, $form_values) {
+  switch ($_POST['op']) {
+    case t('add'):    
+      if($form_values['domain'] == "empty") {
+        form_set_error('domain', t('You need to chose a domain')); 
+      } else {
+          db_set_active('postfix');
+          $query = "SELECT source FROM {forwardings} WHERE source = '%s'"; 
+          if (db_num_rows(db_query($query, '@'. $form_values['domain'])) != 0){
+            form_set_error('domain',t('@%domain already exists in forwardings', array('%domain' => '@'. $form_values['domain'])));
+          }
+          db_set_active('default');   
+        if (!empty($form_values['user'])) { 
+          if (!preg_match(REGEX_USER, $form_values['user'])) {
+            form_set_error('user', t('User %user contains invalid characters', array('%user' => $form_values['user'])));
+          } else {
+            // @todo check if source already exists as forwardings.source
+            db_set_active('postfix');
+            $query = "SELECT source FROM {forwardings} WHERE source = '%s'"; 
+            if (db_num_rows(db_query($query, $form_values['user']. '@'. $form_values['domain'])) != 0){
+              db_set_active('default');   
+              form_set_error('user',t('User %user combination with', array('%user' => $form_values['user'])));
+              form_set_error('domain',t('Domain %domain already exists in forwardings', array('%domain' => $form_values['domain'])));
+            }
+            db_set_active('default');   
+          }        
+        }
+      }
+      // @todo validation of $form_values['_destination']
+      drupal_set_message('@todo validation of $form_values[\'_destination\'] ');
+      break;
+    case t('change'): 
+     drupal_set_message('@todo change');
+     break;
+  }
+}// function postfix_forwarding_add_validate()
+
+/**
+ *Submission of postfix_forwarding_add()
+ */
+function postfix_forwarding_add_submit($form_id, $form_values) {
+  switch($_POST['op']) {
+    case t('add'): 
+      $source = $form_values['user'] . '@' . $form_values['domain'];
+      $inserted_msg = t('forwarding from %source to %destination inserted', 
+                  array('%source' => $source,
+                   '%destination' => $form_values['_destination'])
+                 );
+      db_set_active('postfix');
+      if (db_query("INSERT INTO {forwardings} (source, destination) VALUES ('%s', '%s')", $source, $form_values['_destination'])) {
+        drupal_set_message($inserted_msg);
+        watchdog('postfix', $inserted_msg, WATCHDOG_NOTICE);
+      }    
+      db_set_active('default');
+      break;
+    case t('change'):
+      drupal_set_message('change');
+      break;
+    case t('delete'):
+      drupal_goto('admin/postfix/forwardings/delete/' .$form_values['orig_source']. '/' .$form_values['orig_destination']);
+      break;
+  }
+}// function postfix_forwarding_add_submit()
+
+/**
+ *Generates an overview of all forwardings with forwardings.source and forwardings.destination
+ *@param $domain The specific domain for the overview
+ *@return HTML a sortable forwarding-table via tablesort_sql()
+ *@todo check checkboxes for mass-deletion
+ *@todo check permissions
+ */
+function postfix_forwardings_overview($domain = NULL) {
+  global $form_values;/**@see node.module in node_admin_nodes, 1147 */
+  if ($_POST['op'] == t('Update')  && $_POST['edit']['sources_chkbx']) {
+    drupal_set_message('Massenloesung Aktualisieren');
+  }
+  if ($domain && $domain != '%') {
+    $filter_domain = $domain;
+    $domains = postfix_get_domains($domain, TRUE);
+  } else {
+    $filter_domain = '%';
+    $domains = postfix_get_domains('%');
+  }
+  $form['filter'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Filter by domain'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#weight' => -10,
+    '#prefix' => '<div class="container-inline">',
+    '#suffix' => '</div>',
+  );
+  $form['filter']['select'] = array(
+    '#type' => 'select',
+    '#title' => t('Domain'),
+    '#options' => $domains,
+    '#weight' => -9,
+    '#attributes'=> '',
+    '#submit' => TRUE,
+  );
+  $form['filter']['submit'] = array(
+    '#type' => 'submit', 
+    '#value' =>t('Filter')
+  );
+  $form['options'] = array('#type' => 'fieldset',
+    '#title' => t('Update options'),
+    '#prefix' => '<div class="container-inline">',
+    '#suffix' => '</div>',
+  );
+  $form['options']['item'] = array(
+    '#type' => 'item',
+    '#value' => t('Delete selected items'),
+  );
+  $form['options']['update'] = array(
+    '#type' => 'submit',
+    '#value' =>t('Update'),
+  );
+  
+  $output =  drupal_get_form('postfix_forwardings_overview',$form);
+
+  $header  = array(
+    array(NULL), // Field for select's
+    array('data' => t('Source'), 'field' => 'f.source', 'sort' => 'asc'),
+    array('data' => t('Destination'), 'field' => 'f.destination'),
+    array('data' => t('Operations'), 'rowspan' => 2) 
+  );
+  $sql = "SELECT f.source, f. destination FROM {forwardings} f WHERE f.source like '%@". $filter_domain . "'";
+  $sql .= tablesort_sql($header);
+  db_set_active('postfix');
+  $result = pager_query($sql, 50); 
+  db_set_active('default');  
+
+  $sources_chkbx = array();
+  $sources = array();
+  $destinations = array();
+  $edit = array();
+  $delete = array();
+
+  while ($forwarding = db_fetch_object($result)) { 
+    $sources_chkbx[$forwarding->source] = '';
+    $sources[$forwarding->source] = $forwarding->source;
+    $destinations[$forwarding->source] = $forwarding->destination;
+    $edit[$forwarding->source] =  l(t('edit'), "admin/postfix/forwardings/add/".$forwarding->source."/".$forwarding->destination, array());
+    $delete[$forwarding->source] =  l(t('delete'), "admin/postfix/forwardings/delete/".$forwarding->source."/".$forwarding->destination, array());
+  };
+
+  $form['sources_chkbx'] = array(
+    '#type' => 'checkboxes',
+    '#options' => $sources_chkbx
+  );
+
+  $output .=  drupal_get_form('postfix_forwardings_overview',$form);
+  
+  foreach(element_children($sources_chkbx) as $key) {
+    $row = array();
+    $row[] = form_render($form['sources_chkbx'][$key]);
+    $row[] = $sources[$key];
+    $row[] = $destinations[$key];
+    $row[] = $edit[$key];
+    $row[] = $delete[$key];
+    $rows[] = $row;
+  }
+
+  $output .= theme('table', $header, $rows);
+  $output .= theme('pager', NULL, 50, 0); 
+  return $output;
+}// postfix_forwardings_overview()
+
+function postfix_forwardings_overview_submit($form_id, $form_values) {
+  //print_r($form_values);
+  if($form_values['submit'] == t('Filter')) {
+    if ($form_values['select'] == '%') {
+      drupal_goto('admin/postfix/forwardings');
+    } else {
+      drupal_goto('admin/postfix/forwardings/filter/'.$form_values['select']);
+    }
+  } elseif($_POST['op'] == 'delete'){
+      drupal_set_message('delete');
+  }
+}
+
+function postfix_forwardings_overview_validate($form_id, $form_values) {
+
+}
+
+/*
+ *Submission of postfix_forwarding_delete_confirm()
+ */
+function postfix_forwarding_delete_confirm_submit($form_id, $form_values) {
+  $msg_succ = t('forwarding from %source to %destination deleted',
+                array('%source' => $form_values['source'], '%destination' => $form_values['_destination'])
+              );
+  $msg_fail = t('could not delete forwarding from %source to %destination deleted',
+                array('%source' => $form_values['source'], '%destination' => $form_values['_destination'])
+              );
+  $sql = "DELETE FROM {forwardings} WHERE source = '%s'";
+  db_set_active('postfix');
+  if (db_affected_rows(db_query($sql, $form_values['source'])) == 1) {
+    drupal_set_message($msg_succ);
+    watchdog('postfix', $msg_succ, WATCHDOG_NOTICE);
+  } else {
+    drupal_set_message($msg_fail);
+  }
+   db_set_active('default');
+}// function postfix_forwarding_delete_confirm_submit()
+
+/**
+ *Generates an overview of all transports with transport.domain and transport.transport
+ *@param $domain The specific domain for the overview
+ *@return HTML a sortable forwarding-table via tablesort_sql()
+ *@todo check checkboxes for mass-deletion
+ *@todo check permissions
+ */
+function postfix_transport_overview($domain = NULL){
+//function postfix_transport_overview($form_id=NULL, $form_values=NULL){
+/*
+  if ($_POST){
+    drupal_set_message('$_POST[edit][select]'.$_POST[edit][select]);//<---
+    $filter_domain = $_POST[edit][select];
+    $filter_form['filter']['#action'] = url('admin/postfix/transport');
+//    $output =  drupal_get_form('postfix_transport_overview', $filter_form);
+  } else {
+    $filter_domain = NULL;
+    $filter_form = postfix_domain_filter($filter_domain);
+    $filter_form['filter']['#action'] = url('admin/postfix/transport');
+  //  $output =  drupal_get_form('postfix_transport_overview', $filter_form);
+  }
+*/  
+  $filter_form = postfix_domain_filter($domain);
+  //$filter_form['filter']['#action'] = url('admin/postfix/transport');
+    
+  $output =  drupal_get_form('postfix_transport_overview', $filter_form);
+  $header = array(
+    array(NULL), // Field for select's
+    array('data' => t('Domain'), 'field' => 't.domain', 'sort' => 'asc'),
+    array('data' => t('Transport'), 'field' => 't.transport'),
+    array('data' => t('Operations'), 'rowspan' => 2) 
+  );
+  $sql = "SELECT t.domain, t.transport FROM {transport} t WHERE t.domain LIKE '%".$domain."'";
+  //$sql = "SELECT t.domain, t.transport FROM {transport} t WHERE t.domain LIKE '%'";
+  $sql .= tablesort_sql($header);
+  db_set_active('postfix');
+  $result = pager_query($sql, 50); 
+  db_set_active('default');  
+  while ($transport = db_fetch_object($result)) { 
+    $rows[] = array(
+      $tr_chkbx[$transport->domain] = '',
+      $tr_domain[$transport->domain] = $transport->domain,
+      $tr_transport[$transport->transport] = $transport->transport,
+      $edit[$forwarding->source] =  l(t('edit'), "admin/postfix/forwardings/add/".$forwarding->source."/".$forwarding->destination, array()),
+      $delete[$forwarding->source] =  l(t('delete'), "admin/postfix/forwardings/delete/".$forwarding->source."/".$forwarding->destination, array()),
+    );
+  };
+
+
+  //$output =  drupal_get_form('postfix_transport_overview', $filter_form);
+  $output .= theme('table', $header, $rows);
+  $output .= theme('pager', NULL, 50, 0); 
+  return $output;
+  
+}
+
+function postfix_transport_overview_submit($form_id=NULL, $form_values=NULL) {  
+  if($form_values['submit'] == t('Filter')) {
+    if ($form_values['select'] == '%') {
+      drupal_goto('admin/postfix/transport');
+    } else {
+      drupal_goto('admin/postfix/transport/filter/'.$form_values['select']);
+    }
+  } elseif($_POST['op'] == 'delete'){
+      drupal_set_message('delete');
+  }
+}
+
+

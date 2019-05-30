@@ -21,5 +21,5 @@ it is based on the howto [Virtual Users And Domains With Postfix, Courier And My
 
 ## Trivia
 
-- My first module, written in late 2006, for **Drupal 4.7** rediscovered within a backup of on one of our servers.
-- This module was the reason why i created a drupal.org account :D
+- My first module, written in late 2006, for Drupal 4.7 rediscovered within a backup of on one of our servers.
+- This module was the reason why i created a [drupal.org account](https://www.drupal.org/user/51103) :D
